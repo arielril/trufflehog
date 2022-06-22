@@ -3,7 +3,6 @@ package filesystem
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -17,7 +16,6 @@ import (
 	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/source_metadatapb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/sourcespb"
-	"github.com/trufflesecurity/trufflehog/v3/pkg/sanitizer"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/sources"
 )
 
@@ -78,6 +76,111 @@ func (s *Source) Init(aCtx context.Context, name string, jobId, sourceId int64, 
 }
 
 // Chunks emits chunks of bytes over a channel.
+func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk) error {
+	for _, path := range s.paths {
+
+		cleanPath := filepath.Clean(path)
+
+		err := s.scanDir(ctx, cleanPath, chunksChan)
+		if err != nil {
+			return err
+		}
+
+	}
+	return nil
+}
+
+func (s *Source) scanDir(ctx context.Context, cleanPath string,
+	chunksChan chan *sources.Chunk) error {
+	err := fs.WalkDir(os.DirFS(cleanPath), ".", func(relativePath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		path := filepath.Join(cleanPath, relativePath)
+
+		file, err := os.Open(path)
+		if err != nil {
+			log.WithError(err).Errorf("Cannot open file %s", path)
+		}
+		info, err := file.Stat()
+		if err != nil {
+			log.WithError(err).Errorf("Cannot stat file %s", path)
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		err = s.scanArchive(ctx, file, path, file.Name(), chunksChan)
+		if err != nil {
+			log.Warn(err)
+			return nil
+		}
+		return nil
+	})
+
+	return err
+}
+
+func (s *Source) scanFile(fileData io.Reader, path string, chunksChan chan *sources.Chunk) error {
+	log.Debugf("Scanning %s", path)
+	//junk, _ := ioutil.ReadAll(fileData)
+	//log.Debugf("%s", string(junk))
+	reader := bufio.NewReaderSize(fileData, BufferSize)
+
+	firstChunk := true
+	for {
+		end := BufferSize
+		buf := make([]byte, BufferSize)
+		n, err := reader.Read(buf)
+
+		if n < BufferSize {
+			end = n
+		}
+
+		if end > 0 {
+			data := buf[0:end]
+
+			if firstChunk {
+				firstChunk = false
+				if common.SkipFile(path, data) {
+					return nil
+				}
+			}
+
+			// We are peeking in case a secret exists in our chunk boundaries,
+			// but we never care if we've run into a peek error.
+			peekData, _ := reader.Peek(PeekSize)
+			chunksChan <- &sources.Chunk{
+				SourceType: s.Type(),
+				SourceName: s.name,
+				SourceID:   s.SourceID(),
+				Data:       append(data, peekData...),
+				SourceMetadata: &source_metadatapb.MetaData{
+					Data: &source_metadatapb.MetaData_Filesystem{
+						Filesystem: &source_metadatapb.Filesystem{
+							File: path,
+						},
+					},
+				},
+				Verify: s.verify,
+			}
+		}
+
+		if err != nil {
+			// io.EOF can be emmitted when 0<n<buffer size
+			if errors.Is(err, io.EOF) {
+				return nil
+			} else {
+				return err
+			}
+		}
+	}
+}
+
+// Chunks emits chunks of bytes over a channel.
+/*
 func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk) error {
 	for i, path := range s.paths {
 		s.SetProgressComplete(i, len(s.paths), fmt.Sprintf("Path: %s", path), "")
@@ -178,3 +281,4 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk) err
 	}
 	return nil
 }
+*/
